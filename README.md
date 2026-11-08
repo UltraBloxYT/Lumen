@@ -13,9 +13,11 @@ xcode-select --install
 2. Open the dmg
 3. Open the installer
 4. Follow the steps
+
 **If it gets blocked:**  
 *MacOS 14 and under*  
 1. Right click > Open
+
 *MacOS 15 and above (also works with 14 and under)*  
 1. Try to open it normally
 2. Open settings
@@ -23,12 +25,14 @@ xcode-select --install
 4. Scroll down and click *Allow* on Lumen
 5. Use touchID/Password
 6. Run anyway (if shown)
+
 *Simple terminal command (do before opening dmg)*  
 ```Zsh
 xattr -d com.apple.quarantine ~/Downloads/Lumen-Installer.dmg
 ```
 # Why Lumen was made
-Lumen was made because I, and probably alot of other people, wanted to have something like Nvidia Overlay or Medal.tv on mac.
+Lumen was made because I, and probably alot of other people, wanted to have something like Nvidia Overlay or Medal.tv on mac.  
+*Disclamer: Lumen is not in any way affiliated with Nvidia or Medal. This was an idea made by me, designed by me, as a single person. I am the only person who made this.*
 # My social media
 Youtube: [@ultrablox-roblox](https://youtube.com/@ultrablox-roblox)  
 Tiktok: [@ultrablox_tiktube](https://www.tiktok.com/@ultrablox_tiktube)  
