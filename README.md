@@ -3,27 +3,27 @@ Lumen is a Minimal screen capture app that features a Screen Recorder, Screensho
 # Source
 You can find the source in [main.swift](Lumen-src/Sources/main.swift)
 # Download
-You can download Lumen at 
+You can download Lumen at [the Releases section](https://github.com/UltraBloxYT/Lumen/releases)  
 Its recommended to install Xcode command line tools package, it might be needed to run this, copy the code and paste it in your terminal
 ```Bash
 xcode-select --install
 ```
 # How to install
-1. Goto [the Realeases section](https://github.com/UltraBloxYT/Lumen/releases) and get the dmg
+1. Goto [the Releases section](https://github.com/UltraBloxYT/Lumen/releases) and get the dmg
 2. Open the dmg
 3. Open the installer
 4. Follow the steps
-**If it gets blocked:**
-MacOS 14 and under
+**If it gets blocked:**  
+*MacOS 14 and under*  
 1. Right click > Open
-MacOS 15 and above (also works with 14 and under)
+*MacOS 15 and above (also works with 14 and under)*  
 1. Try to open it normally
 2. Open settings
-3. Click privacy & secuity
+3. Click privacy & security 
 4. Scroll down and click *Allow* on Lumen
 5. Use touchID/Password
 6. Run anyway (if shown)
-Simple terminal command (do before opening dmg)
+*Simple terminal command (do before opening dmg)*  
 ```Zsh
 xattr -d com.apple.quarantine ~/Downloads/Lumen-Installer.dmg
 ```
