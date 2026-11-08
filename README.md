@@ -31,6 +31,6 @@ xattr -d com.apple.quarantine ~/Downloads/Lumen-Installer.dmg
 Lumen was made because I, and probably alot of other people, wanted to have something like Nvidia Overlay or Medal.tv on mac.
 # My social media
 Youtube: [@ultrablox-roblox](https://youtube.com/@ultrablox-roblox)  
-Tiktok: [@ultrablox-tiktube](https://www.tiktok.com/@ultrablox_tiktube)  
+Tiktok: [@ultrablox_tiktube](https://www.tiktok.com/@ultrablox_tiktube)  
 Please follow these accounts, it can help alot :D  
 These accounts are based off roblox by the way if you did not know
