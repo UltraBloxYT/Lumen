@@ -20,7 +20,8 @@ func registerDefaults() {
     UD.register(defaults: [
         "recH": 1080, "recFPS": 60, "recMic": false, "recSys": true, "recQ": 2,
         "repOn": true, "repSec": 60, "repH": 1080, "repFPS": 60, "repMic": false, "repSys": true, "repQ": 1,
-        "shotH": 0, "launch": true, "notices": true, "setupDone": false
+        "shotH": 0, "launch": true, "notices": true, "setupDone": false,
+        "proof": true, "wm": false, "wmPos": "bottomRight", "perfMode": "normal", "perfAnim": true, "perfPin": true, "perfSet": true, "perfUI": true
     ])
 }
 
@@ -36,6 +37,7 @@ enum Disp {
     }
     static var maxFPS: Int { max(60, screen.maximumFramesPerSecond) }
     static var heights: [Int] { [720, 1080, 1440, 2160].filter { $0 < native.h } }
+    static var cheapH: Int { native.h > 720 ? 720 : 0 }
     static func dims(_ h: Int) -> (w: Int, h: Int) {
         let n = native
         if h <= 0 || h >= n.h { return (n.w & ~1, n.h & ~1) }
@@ -46,11 +48,76 @@ enum Disp {
 
 func resLabel(_ h: Int) -> String { h == 0 ? "Max" : (h == 2160 ? "4K" : "\(h)p") }
 
+// LUMEN-V2: performance mode, streamproof, look
+// LUMEN-V3: modes
+enum PerfMode: String { case normal, low, lite, cheap }
+
+enum Mode {
+    static var liteOn = false          // Lumen Lite lives in memory only, so it never survives a relaunch
+    static var liteKeepBuffer = true
+    static var current: PerfMode {
+        if liteOn { return .lite }
+        return PerfMode(rawValue: UD.string(forKey: "perfMode") ?? "normal") ?? .normal
+    }
+}
+
+enum Perf {
+    static var mode: PerfMode { Mode.current }
+    static var low: Bool { mode == .low }
+    static var lite: Bool { mode == .lite }
+    static var cheap: Bool { mode == .cheap }
+    static var on: Bool { mode != .normal }
+    static var noAnim: Bool { low || (cheap && UD.bool(forKey: "perfAnim")) }
+    static var noProof: Bool { on }    // streamproof is off (and locked) in every mode
+    static var cheapSet: Bool { cheap && UD.bool(forKey: "perfSet") }
+    static var cheapUI: Bool { low || (cheap && UD.bool(forKey: "perfUI")) }
+    // LUMEN-V5: the bar stays open and Lumen does not listen for the open/close hotkey
+    static var pinned: Bool { low || (cheap && UD.bool(forKey: "perfPin")) }
+}
+
+enum Proof { static var on: Bool { UD.bool(forKey: "proof") && !Perf.noProof } }
+
+final class Look: ObservableObject {
+    static let shared = Look()
+    static func r(_ x: CGFloat) -> CGFloat { Perf.cheapUI ? 0 : x }
+    static var pill: CGFloat { Perf.cheapUI ? 0 : 100 }
+    @Published var rev = 0
+    private var sig = Look.signature()
+    private static func signature() -> String { "\(Perf.mode.rawValue)\(Perf.noAnim)\(Perf.cheapSet)\(Perf.cheapUI)\(Perf.pinned)\(Proof.on)" }
+    private init() {
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.check()
+        }
+    }
+    func check() {
+        let s = Look.signature()
+        guard s != sig else { return }
+        sig = s
+        rev += 1
+        Overlay.shared.applyLook()
+        Notices.shared.applyLook()
+        HotKey.register()
+        if Perf.pinned { Overlay.shared.pin() }
+    }
+}
+
+
 struct Cfg: Equatable {
     var h: Int, fps: Int, sys: Bool, mic: Bool, q: Int
+    var proof = Proof.on
+    var potato = false
+    var wm = WM.on
     static func load(_ p: String) -> Cfg {
-        Cfg(h: UD.integer(forKey: p + "H"), fps: max(1, UD.integer(forKey: p + "FPS")),
-            sys: UD.bool(forKey: p + "Sys"), mic: UD.bool(forKey: p + "Mic"), q: UD.integer(forKey: p + "Q"))
+        // Lumen Lite has no settings: always the defaults
+        if Perf.lite { return Cfg(h: 1080, fps: 60, sys: true, mic: false, q: p == "rep" ? 1 : 2) }
+        var c = Cfg(h: UD.integer(forKey: p + "H"), fps: max(1, UD.integer(forKey: p + "FPS")),
+                    sys: UD.bool(forKey: p + "Sys"), mic: UD.bool(forKey: p + "Mic"), q: UD.integer(forKey: p + "Q"))
+        if Perf.low {
+            c.potato = true      // same settings, lighter capture and encode path
+        } else if Perf.cheapSet {
+            c.h = Disp.cheapH; c.fps = 30; c.q = 0
+        }
+        return c
     }
     var size: (w: Int, h: Int) { Disp.dims(h) }
     var bitrate: Int {
@@ -113,7 +180,7 @@ enum HotKey {
     static var action: (() -> Void)?
     static func register() {
         unregister()
-        guard UD.object(forKey: "hkCode") != nil else { return }
+        guard UD.object(forKey: "hkCode") != nil, !Perf.pinned else { return }
         if !installed {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in HotKey.action?(); return noErr }, 1, &spec, nil, nil)
@@ -172,7 +239,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
     private var stream: SCStream?
     private var micSession: AVCaptureSession?
     private(set) var micOn = false
-    let q = DispatchQueue(label: "lumen.capture", qos: .userInteractive)
+    private(set) var q = DispatchQueue(label: "lumen.capture", qos: .userInteractive)
     var onVideo: ((CMSampleBuffer) -> Void)?
     var onSys: ((CMSampleBuffer) -> Void)?
     var onMic: ((CMSampleBuffer) -> Void)?
@@ -184,20 +251,26 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
         guard let disp = content.displays.first(where: { $0.displayID == Disp.id }) ?? content.displays.first else {
             throw NSError(domain: "lumen", code: 1)
         }
-        let me = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
-        let filter = SCContentFilter(display: disp, excludingApplications: me, exceptingWindows: [])
+        var me: [SCRunningApplication] = []
+        if c.proof { me = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier } }
+        var keep: [SCWindow] = []
+        if c.proof && c.wm, let n = Watermark.shared.number {
+            keep = content.windows.filter { $0.windowID == CGWindowID(n) }
+        }
+        let filter = SCContentFilter(display: disp, excludingApplications: me, exceptingWindows: keep)
         let cfg = SCStreamConfiguration()
         let s = c.size
         cfg.width = s.w; cfg.height = s.h
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(c.fps))
-        cfg.pixelFormat = kCVPixelFormatType_32BGRA
-        cfg.queueDepth = 6
+        cfg.pixelFormat = c.potato ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA
+        cfg.queueDepth = c.potato ? 3 : 6
         cfg.showsCursor = true
         if c.sys { cfg.capturesAudio = true; cfg.sampleRate = 48000; cfg.channelCount = 2; cfg.excludesCurrentProcessAudio = true }
         return (filter, cfg)
     }
 
     func start(_ c: Cfg) async throws {
+        q = DispatchQueue(label: "lumen.capture", qos: c.potato ? .utility : .userInteractive)
         let (filter, cfg) = try await Capturer.make(c)
         let st = SCStream(filter: filter, configuration: cfg, delegate: self)
         try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: q)
@@ -237,6 +310,120 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudio
     func stream(_ stream: SCStream, didStopWithError error: Error) { onStop?() }
 }
 
+// Lumen Low: when the encoder falls behind, keep every other frame until it recovers (never blocks capture).
+// LUMEN-V4: watermark
+enum WM {
+    static var on: Bool { UD.bool(forKey: "wm") && !Perf.lite }
+}
+
+enum WMPos: String {
+    case topLeft, topCenter, topRight, bottomLeft, bottomCenter, bottomRight
+}
+
+struct WatermarkView: View {
+    let icon: NSImage
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Recorded with").font(.system(size: 12, weight: .medium)).foregroundColor(Color.white.opacity(0.85))
+            Image(nsImage: icon).resizable().frame(width: 18, height: 18)
+            Text("Lumen").font(.system(size: 12, weight: .semibold)).foregroundColor(Color.white)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Color.black))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(Color.line, lineWidth: 1))
+        .fixedSize()
+    }
+}
+
+// A real on-screen badge (so it lands in recordings, replays and screenshots without any per-frame work).
+// With streamproof on it is explicitly kept in the capture while the rest of Lumen stays hidden.
+final class Watermark {
+    static let shared = Watermark()
+    private var panel: NSPanel?
+    private var sig = ""
+    private(set) var number: Int?
+    private init() {
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+    func refresh() {
+        let s = "\(WM.on)\(UD.string(forKey: "wmPos") ?? "")"
+        guard s != sig else { return }
+        sig = s
+        guard WM.on else { panel?.orderOut(nil); number = nil; return }
+        if panel == nil { build() }
+        guard let p = panel else { return }
+        place(p)
+        p.orderFrontRegardless()
+        number = p.windowNumber
+    }
+    private func build() {
+        let host = NSHostingView(rootView: WatermarkView(icon: NSApp.applicationIconImage))
+        var size = host.fittingSize
+        if size.width < 10 || size.height < 10 { size = NSSize(width: 176, height: 32) }
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false
+        p.ignoresMouseEvents = true
+        p.level = .screenSaver
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        p.hidesOnDeactivate = false; p.isFloatingPanel = true
+        p.appearance = NSAppearance(named: .darkAqua)
+        p.contentView = host
+        panel = p
+    }
+    private func place(_ p: NSPanel) {
+        let f = Disp.screen.visibleFrame, s = p.frame.size, m: CGFloat = 12
+        let left = f.minX + m, right = f.maxX - s.width - m, midX = f.midX - s.width / 2
+        let top = f.maxY - s.height - m, bottom = f.minY + m
+        let pos = WMPos(rawValue: UD.string(forKey: "wmPos") ?? "") ?? .bottomRight
+        let pt: NSPoint
+        switch pos {
+        case .topLeft: pt = NSPoint(x: left, y: top)
+        case .topCenter: pt = NSPoint(x: midX, y: top)
+        case .topRight: pt = NSPoint(x: right, y: top)
+        case .bottomLeft: pt = NSPoint(x: left, y: bottom)
+        case .bottomCenter: pt = NSPoint(x: midX, y: bottom)
+        case .bottomRight: pt = NSPoint(x: right, y: bottom)
+        }
+        p.setFrameOrigin(pt)
+    }
+}
+
+struct WMPicker: View {
+    @AppStorage("wmPos") var pos = "bottomRight"
+    var body: some View {
+        VStack(spacing: 6) {
+            Seg(opts: [("Top left", "topLeft"), ("Top center", "topCenter"), ("Top right", "topRight")], sel: $pos)
+            Seg(opts: [("Bottom left", "bottomLeft"), ("Bottom center", "bottomCenter"), ("Bottom right", "bottomRight")], sel: $pos)
+        }
+    }
+}
+
+final class Governor {
+    static let shared = Governor()
+    private let lock = NSLock()
+    private var late = 0, good = 0
+    private var shedding = false
+    private var flip = false
+    func admit() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard shedding else { return true }
+        flip.toggle()
+        return flip
+    }
+    func report(ready: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if ready {
+            late = max(0, late - 1); good += 1
+            if shedding && good > 180 { shedding = false; good = 0 }
+        } else {
+            good = 0; late += 1
+            if late > 6 { shedding = true }
+        }
+    }
+}
+
 final class MediaWriter {
     let url: URL
     var tag = 0
@@ -248,17 +435,20 @@ final class MediaWriter {
     private var t0 = CMTime.zero
     private var last = CMTime.zero
     private let fps: Int
+    private let gov: Governor?
+    private var wrote = false
     var duration: Double { started ? max(0, (last - t0).seconds) + 1.0 / Double(fps) : 0 }
 
     init(url: URL, cfg: Cfg, sys: Bool, mic: Bool) throws {
         self.url = url; fps = cfg.fps
+        gov = cfg.potato ? Governor.shared : nil
         w = try AVAssetWriter(url: url, fileType: .mp4)
         let s = cfg.size
         let props: [String: Any] = [
             AVVideoAverageBitRateKey: cfg.bitrate,
-            AVVideoMaxKeyFrameIntervalDurationKey: 1.0,
+            AVVideoMaxKeyFrameIntervalDurationKey: cfg.potato ? 2.0 : 1.0,
             AVVideoExpectedSourceFrameRateKey: cfg.fps,
-            AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            AVVideoProfileLevelKey: cfg.potato ? AVVideoProfileLevelH264BaselineAutoLevel : AVVideoProfileLevelH264HighAutoLevel,
             AVVideoAllowFrameReorderingKey: false
         ]
         let vs: [String: Any] = [
@@ -285,7 +475,10 @@ final class MediaWriter {
             guard w.startWriting() else { return }
             w.startSession(atSourceTime: pts); started = true; t0 = pts
         }
-        if w.status == .writing, v.isReadyForMoreMediaData { v.append(sb); last = pts }
+        if wrote, let g = gov, !g.admit() { return }
+        let ready = w.status == .writing && v.isReadyForMoreMediaData
+        gov?.report(ready: ready)
+        if ready { v.append(sb); last = pts; wrote = true }
     }
     func audio(_ sb: CMSampleBuffer, mic isMic: Bool) {
         guard started, w.status == .writing, CMSampleBufferGetPresentationTimeStamp(sb) >= t0 else { return }
@@ -347,8 +540,8 @@ final class ReplayBuffer {
     private let dir = FileManager.default.temporaryDirectory.appendingPathComponent("lumen-replay")
     private(set) var running: Cfg?
     var isOn: Bool { running != nil }
-    private var length: Double { Double(UD.integer(forKey: "repSec")) }
-    private var segDur: Double { min(10, max(2, length / 12)) }
+    private var length: Double { Perf.lite ? 60 : Double(UD.integer(forKey: "repSec")) }
+    private var segDur: Double { Perf.low ? min(15, max(5, length / 10)) : min(10, max(2, length / 12)) }
 
     func start() async throws {
         let c = Cfg.load("rep")
@@ -486,7 +679,7 @@ final class Grabber: NSObject, SCStreamOutput {
 
 enum Shot {
     static func take() async -> URL? {
-        let c = Cfg(h: UD.integer(forKey: "shotH"), fps: 30, sys: false, mic: false, q: 0)
+        let c = Cfg(h: Perf.lite ? 0 : UD.integer(forKey: "shotH"), fps: 30, sys: false, mic: false, q: 0)
         guard let (filter, cfg) = try? await Capturer.make(c) else { return nil }
         var img: CGImage?
         img = await Grabber().grab(filter, cfg)
@@ -554,7 +747,7 @@ final class Ctl {
     // Keeps the replay buffer in line with the settings
     func sync() {
         guard !busy else { return }
-        let want = UD.bool(forKey: "repOn"), cfg = Cfg.load("rep"), have = rep.running
+        let want = Perf.lite ? Mode.liteKeepBuffer : UD.bool(forKey: "repOn"), cfg = Cfg.load("rep"), have = rep.running
         if !want { failed = nil }
         let need = want ? (have != cfg && failed != cfg) : (have != nil)
         guard need else { return }
@@ -588,7 +781,7 @@ final class Model: ObservableObject {
 // MARK: - Windows
 enum Metrics {
     static let small = NSSize(width: 184, height: 54)
-    static let big = NSSize(width: 420, height: 450)
+    static let big = NSSize(width: 440, height: 450)
 }
 
 final class KeyPanel: NSPanel { override var canBecomeKey: Bool { true } }
@@ -597,7 +790,7 @@ func styleP(_ p: NSPanel) {
     p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false
     p.level = .screenSaver
     p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-    p.sharingType = .none
+    p.sharingType = Proof.on ? .none : .readOnly
     p.hidesOnDeactivate = false; p.isFloatingPanel = true
     p.appearance = NSAppearance(named: .darkAqua)
 }
@@ -605,11 +798,19 @@ func styleP(_ p: NSPanel) {
 final class Overlay {
     static let shared = Overlay()
     let panel: KeyPanel
+    private let anchor: NSWindow
     private(set) var visible = true
+    private var gen = 0
     private init() {
+        // Invisible 1px window so Lumen is always listed as an on-screen app and can be excluded from captures.
+        let a = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1), styleMask: [.borderless], backing: .buffered, defer: false)
+        a.isOpaque = false; a.backgroundColor = .clear; a.hasShadow = false
+        a.ignoresMouseEvents = true; a.isReleasedWhenClosed = false
+        a.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        anchor = a
         panel = KeyPanel(contentRect: NSRect(origin: .zero, size: Metrics.small), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         styleP(panel)
-        panel.hasShadow = true
+        panel.hasShadow = !Perf.cheapUI
         panel.isMovableByWindowBackground = true
         let h = NSHostingView(rootView: OverlayView())
         h.sizingOptions = []
@@ -618,18 +819,49 @@ final class Overlay {
     func place() {
         let f = Disp.screen.visibleFrame, s = Metrics.small
         panel.setFrame(NSRect(x: f.midX - s.width / 2, y: f.maxY - s.height - 10, width: s.width, height: s.height), display: true)
+        anchor.setFrameOrigin(Disp.screen.frame.origin)
+        anchor.orderFrontRegardless()
     }
     func setExpanded(_ e: Bool) {
         let s = e ? Metrics.big : Metrics.small, f = panel.frame
-        panel.setFrame(NSRect(x: f.midX - s.width / 2, y: f.maxY - s.height, width: s.width, height: s.height), display: true, animate: true)
+        panel.setFrame(NSRect(x: f.midX - s.width / 2, y: f.maxY - s.height, width: s.width, height: s.height), display: true, animate: !Perf.noAnim)
     }
-    // Hidden = fully transparent and click-through, so the app always owns an on-screen window to exclude from capture.
+    // Hidden means ordered out (not just transparent), so it can't flash while you swipe between desktops.
     func setVisible(_ v: Bool) {
         visible = v
+        gen += 1
+        let g = gen
         panel.ignoresMouseEvents = !v
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.15; self.panel.animator().alphaValue = v ? 1 : 0 }
+        if v {
+            panel.alphaValue = Perf.noAnim ? 1 : 0
+            panel.orderFrontRegardless()
+            if !Perf.noAnim {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.15
+                    self.panel.animator().alphaValue = 1
+                }
+            }
+        } else if Perf.noAnim {
+            panel.orderOut(nil)
+        } else {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.15
+                self.panel.animator().alphaValue = 0
+            }, completionHandler: {
+                if !self.visible && self.gen == g { self.panel.orderOut(nil) }
+            })
+        }
     }
-    func toggle() { setVisible(!visible) }
+    func toggle() {
+        if Perf.pinned { Notices.show("Performance mode is on"); return }
+        setVisible(!visible)
+    }
+    func pin() { if !visible { setVisible(true) } }
+    func applyLook() {
+        panel.hasShadow = !Perf.cheapUI
+        panel.invalidateShadow()
+        panel.sharingType = Proof.on ? .none : .readOnly
+    }
 }
 
 final class NoticeModel: ObservableObject { @Published var text = "" }
@@ -640,8 +872,8 @@ struct NoticeView: View {
         Text(model.text)
             .font(.system(size: 12, weight: .medium)).foregroundColor(.white)
             .padding(.horizontal, 16).padding(.vertical, 9)
-            .background(Capsule().fill(Color.black))
-            .overlay(Capsule().strokeBorder(Color.line, lineWidth: 1))
+            .background(RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(Color.black))
+            .overlay(RoundedRectangle(cornerRadius: Look.pill, style: .continuous).strokeBorder(Color.line, lineWidth: 1))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -651,13 +883,16 @@ final class Notices {
     private var panel: NSPanel?
     private let model = NoticeModel()
     private var work: DispatchWorkItem?
+    private var gen = 0
     func setup() {
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 44), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        styleP(p); p.ignoresMouseEvents = true; p.alphaValue = 0
+        styleP(p); p.ignoresMouseEvents = true
         let h = NSHostingView(rootView: NoticeView(model: model)); h.sizingOptions = []
-        p.contentView = h; p.orderFrontRegardless(); panel = p
+        p.contentView = h
+        panel = p   // stays ordered out until a notice is shown
     }
-    static func show(_ t: String) { DispatchQueue.main.async { shared.display(t) } }
+    func applyLook() { panel?.sharingType = Proof.on ? .none : .readOnly }
+    static func show(_ t: String) { DispatchQueue.main.async { if Perf.lite { Lite.shared.flash(t) } else { shared.display(t) } } }
     private func display(_ t: String) {
         guard UD.bool(forKey: "notices"), let p = panel else { return }
         model.text = t
@@ -665,8 +900,26 @@ final class Notices {
         let vis = Overlay.shared.visible
         p.setFrameOrigin(NSPoint(x: (vis ? o.midX : sf.midX) - p.frame.width / 2, y: vis ? o.minY - 50 : sf.maxY - 54))
         work?.cancel()
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.18; p.animator().alphaValue = 1 }
-        let w = DispatchWorkItem { NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 0 } }
+        gen += 1
+        let g = gen
+        let quick = Perf.noAnim
+        if !p.isVisible { p.alphaValue = quick ? 1 : 0 }
+        p.orderFrontRegardless()
+        if quick { p.alphaValue = 1 } else {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.18
+                p.animator().alphaValue = 1
+            }
+        }
+        let w = DispatchWorkItem { [weak self] in
+            if quick { p.orderOut(nil); return }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.3
+                p.animator().alphaValue = 0
+            }, completionHandler: {
+                if let s = self, s.gen == g { p.orderOut(nil) }
+            })
+        }
         work = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4, execute: w)
     }
@@ -685,14 +938,14 @@ struct IconBtn: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundColor(on ? Color.black : Color.white)
                 .frame(width: 34, height: 34)
-                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(on ? Color.white : Color.white.opacity(hover ? 0.18 : 0.08)))
-                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.line, lineWidth: 1))
+                .background(RoundedRectangle(cornerRadius: Look.r(9), style: .continuous).fill(on ? Color.white : Color.white.opacity(hover ? 0.18 : 0.08)))
+                .overlay(RoundedRectangle(cornerRadius: Look.r(9), style: .continuous).strokeBorder(Color.line, lineWidth: 1))
                 .overlay(alignment: .topTrailing) {
-                    if dot { Circle().fill(Color.white).frame(width: 5, height: 5).padding(4) }
+                    if dot { RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(Color.white).frame(width: 5, height: 5).padding(4) }
                 }
         }
         .buttonStyle(.plain)
-        .onHover { hover = $0 }
+        .onHover { if !Perf.cheapUI { hover = $0 } }
     }
 }
 
@@ -703,8 +956,8 @@ struct MonoBtn: ButtonStyle {
             .font(.system(size: 12, weight: .medium))
             .foregroundColor(primary ? Color.black : Color.white)
             .padding(.horizontal, 14).padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(primary ? Color.white : Color.white.opacity(0.1)))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.line, lineWidth: 1))
+            .background(RoundedRectangle(cornerRadius: Look.r(8), style: .continuous).fill(primary ? Color.white : Color.white.opacity(0.1)))
+            .overlay(RoundedRectangle(cornerRadius: Look.r(8), style: .continuous).strokeBorder(Color.line, lineWidth: 1))
             .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
@@ -738,11 +991,11 @@ struct Tog: View {
             }
             Spacer()
             ZStack(alignment: on ? Alignment.trailing : Alignment.leading) {
-                Capsule().fill(on ? Color.white : Color.white.opacity(0.14)).frame(width: 36, height: 20)
-                Circle().fill(on ? Color.black : Color.white).frame(width: 14, height: 14).padding(3)
+                RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(on ? Color.white : Color.white.opacity(0.14)).frame(width: 36, height: 20)
+                RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(on ? Color.black : Color.white).frame(width: 14, height: 14).padding(3)
             }
             .contentShape(Rectangle())
-            .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { on.toggle() } }
+            .onTapGesture { withAnimation(Perf.noAnim ? nil : Animation.easeOut(duration: 0.12)) { on.toggle() } }
         }
     }
 }
@@ -758,7 +1011,7 @@ struct Seg<T: Hashable>: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(sel == o.1 ? Color.black : Color.white.opacity(0.8))
                     .frame(maxWidth: .infinity).padding(.vertical, 7)
-                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(sel == o.1 ? Color.white : Color.soft))
+                    .background(RoundedRectangle(cornerRadius: Look.r(7), style: .continuous).fill(sel == o.1 ? Color.white : Color.soft))
                     .contentShape(Rectangle())
                     .onTapGesture { sel = o.1 }
             }
@@ -768,23 +1021,34 @@ struct Seg<T: Hashable>: View {
 
 struct ResPicker: View {
     @AppStorage var h: Int
-    init(_ key: String) { _h = AppStorage(wrappedValue: 1080, key) }
+    let key: String
+    init(_ key: String) { self.key = key; _h = AppStorage(wrappedValue: 1080, key) }
     var body: some View {
         let nat = Disp.native
+        let locked = Perf.cheapSet && key != "shotH"
+        let cur = locked ? Disp.cheapH : h
         let opts: [(String, Int)] = Disp.heights.map { (resLabel($0), $0) } + [("Max", 0)]
         VStack(alignment: .leading, spacing: 6) {
-            Seg(opts: opts, sel: Binding(get: { h >= nat.h ? 0 : h }, set: { h = $0 }))
-            Text("Display max \(nat.w) × \(nat.h)").font(.system(size: 10)).foregroundColor(Color.dim)
+            Seg(opts: opts, sel: Binding(get: { cur >= nat.h ? 0 : cur }, set: { v in
+                if locked { Notices.show("Performance mode is on") } else { h = v }
+            }))
+            Text(locked ? "Locked by Performance mode" : "Display max \(nat.w) × \(nat.h)")
+                .font(.system(size: 10)).foregroundColor(Color.dim)
         }
     }
 }
 
 struct FPSPicker: View {
     @AppStorage var f: Int
-    init(_ key: String) { _f = AppStorage(wrappedValue: 60, key) }
+    let key: String
+    init(_ key: String) { self.key = key; _f = AppStorage(wrappedValue: 60, key) }
     var body: some View {
+        let locked = Perf.cheapSet
+        let cur = locked ? 30 : f
         let opts: [(String, Int)] = [30, 60, 120].filter { $0 <= Disp.maxFPS }.map { ("\($0) fps", $0) }
-        Seg(opts: opts, sel: $f)
+        Seg(opts: opts, sel: Binding(get: { cur }, set: { v in
+            if locked { Notices.show("Performance mode is on") } else { f = v }
+        }))
     }
 }
 
@@ -809,9 +1073,9 @@ struct LenSlider: View {
             GeometryReader { g in
                 let t = CGFloat(log(Double(max(5, sec)) / 5) / log(360.0))
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.line).frame(height: 4)
-                    Capsule().fill(Color.white).frame(width: max(4, g.size.width * t), height: 4)
-                    Circle().fill(Color.white).frame(width: 14, height: 14).offset(x: (g.size.width - 14) * t)
+                    RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(Color.line).frame(height: 4)
+                    RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(Color.white).frame(width: max(4, g.size.width * t), height: 4)
+                    RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(Color.white).frame(width: 14, height: 14).offset(x: (g.size.width - 14) * t)
                 }
                 .frame(height: 14)
                 .contentShape(Rectangle())
@@ -856,7 +1120,12 @@ struct RepTab: View {
             LenSlider()
             Sec("Resolution") { ResPicker("repH") }
             Sec("Frame rate") { FPSPicker("repFPS") }
-            Sec("Quality") { Seg(opts: [("Low", 0), ("Medium", 1), ("High", 2), ("Ultra", 3)], sel: $q) }
+            Sec("Quality") {
+                Seg(opts: [("Low", 0), ("Medium", 1), ("High", 2), ("Ultra", 3)],
+                    sel: Binding(get: { Perf.cheapSet ? 0 : q }, set: { v in
+                        if Perf.cheapSet { Notices.show("Performance mode is on") } else { q = v }
+                    }))
+            }
             Tog("System audio", "Game and app sound", $sys)
             Tog("Microphone", "Off by default", $mic)
             Note("Press the replay button to save a clip. The buffer is kept on disk while running, so long lengths at high quality use more space.")
@@ -873,6 +1142,158 @@ struct ShotTab: View {
     }
 }
 
+func locked(_ b: Binding<Bool>, _ lock: Bool) -> Binding<Bool> {
+    Binding(get: { lock ? false : b.wrappedValue }, set: { v in
+        if lock { Notices.show("Performance mode is on") } else { b.wrappedValue = v }
+    })
+}
+
+struct ModeBtn: View {
+    let t: String; let s: String; let act: () -> Void
+    var body: some View {
+        Button(action: act) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(t).font(.system(size: 14, weight: .semibold)).foregroundColor(Color.white)
+                Text(s).font(.system(size: 11)).foregroundColor(Color.dim).fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: Look.r(12), style: .continuous).fill(Color.soft))
+            .overlay(RoundedRectangle(cornerRadius: Look.r(12), style: .continuous).strokeBorder(Color.line, lineWidth: 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct PerfTab: View {
+    @AppStorage("perfAnim") var anim = true
+    @AppStorage("perfSet") var cheapSet = true
+    @AppStorage("perfUI") var cheapUI = true
+    @AppStorage("perfPin") var pin = true
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            switch Perf.mode {
+            case .normal, .lite:
+                ModeBtn(t: "Lumen Low", s: "Built for very slow Macs. Keeps your normal settings but runs a much lighter capture pipeline that backs off by itself when your Mac struggles. Flat UI, no animations. The bar stays open and the hotkey is off.") { PerfActions.enterLow() }
+                ModeBtn(t: "Lumen Lite", s: "Swaps the overlay for a plain macOS menu opened with your hotkey. No settings. Resets when Lumen closes.") { PerfActions.askLite() }
+                ModeBtn(t: "Cheap", s: "Lowest recording and replay settings, no animations, a flat UI and an always-open bar. Each can be switched off.") { PerfActions.enterCheap() }
+                Note("Performance modes turn streamproof off. Screenshots keep their own resolution setting.")
+            case .low:
+                Note("Lumen Low is on. Your normal settings apply, but capture and encoding use a lighter pipeline that sheds frames by itself when your Mac falls behind. Flat UI, no animations, streamproof off. The bar stays open and the hotkey is off.")
+                Button("Exit performance mode") { PerfActions.exit() }.buttonStyle(MonoBtn(primary: true))
+            case .cheap:
+                Tog("No animations", "Instant windows and controls", $anim)
+                Tog("No streamproof", "Locked on in performance mode", Binding(get: { true }, set: { _ in Notices.show("Performance mode is on") }))
+                Tog("Cheap settings", "Locks recording and replay to the lowest resolution, frame rate and quality", $cheapSet)
+                Tog("Cheap UI", "Square corners, no shadow or hover effects", $cheapUI)
+                Tog("Always-open UI", "The bar stays on screen and the hotkey is not checked", $pin)
+                Button("Exit performance mode") { PerfActions.exit() }.buttonStyle(MonoBtn(primary: true))
+            }
+        }
+    }
+}
+
+enum PerfActions {
+    static func enterLow() { UD.set("low", forKey: "perfMode"); Notices.show("Lumen Low is on") }
+    static func enterCheap() { UD.set("cheap", forKey: "perfMode"); Notices.show("Cheap mode is on") }
+    static func exit() { UD.set("normal", forKey: "perfMode"); Notices.show("Performance mode is off") }
+    static func askLite() {
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Do you want to keep replay buffer?"
+            a.informativeText = "Lumen Lite replaces the overlay with a plain macOS menu and has no settings. It resets the next time Lumen opens."
+            a.addButton(withTitle: "Yes")
+            a.addButton(withTitle: "No")
+            a.addButton(withTitle: "Cancel")
+            let r = a.runModal()
+            if r == .alertThirdButtonReturn { return }
+            Lite.shared.begin(keepBuffer: r == .alertFirstButtonReturn)
+        }
+    }
+}
+
+// Lumen Lite: no custom UI. The hotkey opens a standard macOS menu from the menu bar item.
+final class Lite: NSObject, NSMenuDelegate {
+    static let shared = Lite()
+    private var isOpen = false
+    private var gen = 0
+    private var recItem: NSMenuItem?
+    private var saveItem: NSMenuItem?
+    private var statusItem: NSStatusItem? { (NSApp.delegate as? AppDelegate)?.item }
+
+    func begin(keepBuffer: Bool) {
+        Mode.liteOn = true
+        Mode.liteKeepBuffer = keepBuffer
+        Model.shared.expanded = false
+        Overlay.shared.setVisible(false)
+        statusItem?.menu = makeMenu()
+        Look.shared.check()
+        Watermark.shared.refresh()
+        Ctl.shared.sync()
+        flash("Lumen Lite is on")
+    }
+
+    private func makeMenu() -> NSMenu {
+        let m = NSMenu(title: "Lumen Lite")
+        m.delegate = self
+        m.autoenablesItems = false
+        let head = NSMenuItem(title: "Lumen Lite", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        m.addItem(NSMenuItem.separator())
+        let s = NSMenuItem(title: "Save Replay", action: #selector(saveReplay), keyEquivalent: "")
+        let r = NSMenuItem(title: "Start Recording", action: #selector(toggleRecord), keyEquivalent: "")
+        let p = NSMenuItem(title: "Take Screenshot", action: #selector(shot), keyEquivalent: "")
+        for i in [s, r, p] { i.target = self; m.addItem(i) }
+        m.addItem(NSMenuItem.separator())
+        let x = NSMenuItem(title: "Exit Lumen Lite", action: #selector(exitLite), keyEquivalent: "")
+        x.target = self
+        m.addItem(x)
+        saveItem = s; recItem = r
+        return m
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        isOpen = true
+        recItem?.title = Ctl.shared.rec.isOn ? "Stop Recording" : "Start Recording"
+        saveItem?.isEnabled = Mode.liteKeepBuffer
+    }
+    func menuDidClose(_ menu: NSMenu) { isOpen = false }
+
+    @objc private func saveReplay() { Ctl.shared.saveReplay() }
+    @objc private func toggleRecord() { Ctl.shared.toggleRecord() }
+    @objc private func shot() { Ctl.shared.screenshot() }
+    @objc private func exitLite() { Lite.relaunch() }
+
+    func toggleMenu() {
+        guard let it = statusItem, let b = it.button else { return }
+        if isOpen { it.menu?.cancelTracking() } else { b.performClick(nil) }
+    }
+
+    func flash(_ t: String) {
+        guard let b = statusItem?.button else { return }
+        b.imagePosition = .imageLeading
+        b.title = " " + t
+        gen += 1
+        let g = gen
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
+            if let s = self, s.gen == g { b.title = "" }
+        }
+    }
+
+    // Quit, then reopen Lumen once this process is gone. Lite is never saved, so it starts normal.
+    static func relaunch() {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$2\"", "sh", "\(pid)", Bundle.main.bundlePath]
+        try? p.run()
+        NSApp.terminate(nil)
+    }
+}
+
 struct RowCard<C: View>: View {
     let t: String; let s: String; let c: C
     init(_ t: String, _ s: String, @ViewBuilder _ c: () -> C) { self.t = t; self.s = s; self.c = c() }
@@ -886,19 +1307,24 @@ struct RowCard<C: View>: View {
             c
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.soft))
+        .background(RoundedRectangle(cornerRadius: Look.r(12), style: .continuous).fill(Color.soft))
     }
 }
 
 struct OtherTab: View {
     @AppStorage("launch") var launch = true
     @AppStorage("notices") var notices = true
+    @AppStorage("proof") var proof = true
+    @AppStorage("wm") var wm = false
     @ObservedObject var hk = HotkeyField.shared
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             Tog("Launch on startup", "Open Lumen when you log in", $launch)
-            Tog("On-screen notices", "Shown on screen, never recorded", $notices)
-            RowCard("Overlay hotkey", "Shows and hides the overlay") {
+            Tog("On-screen notices", "Short pop-ups for actions", $notices)
+            Tog("Streamproof", Perf.noProof ? "Locked off by Performance mode" : "Keeps the overlay and notices out of recordings", locked($proof, Perf.noProof))
+            Tog("Watermark", "Shows a Recorded with Lumen badge on screen and in your captures", $wm)
+            Sec("Watermark position") { WMPicker() }
+            RowCard("Overlay hotkey", Perf.pinned ? "Off while the UI is always open" : "Shows and hides the overlay") {
                 Button(hk.listening ? "Press keys…" : hk.label) { hk.listen() }.buttonStyle(MonoBtn())
             }
             HStack(spacing: 8) {
@@ -914,26 +1340,27 @@ struct OtherTab: View {
 // MARK: - Overlay root
 struct OverlayView: View {
     @ObservedObject var m = Model.shared
-    let tabs = ["Recording", "Replay", "Screenshot", "Other"]
+    @ObservedObject var look = Look.shared
+    var tabs: [String] { ["Recording", "Replay", "Screenshot", Perf.low ? "Exit performance mode" : "Performance", "Other"] }
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 IconBtn(sym: "gobackward", dot: m.bufferOn) { Ctl.shared.saveReplay() }
                 IconBtn(sym: m.recording ? "stop.fill" : "record.circle", on: m.recording) { Ctl.shared.toggleRecord() }
                 IconBtn(sym: "camera") { Ctl.shared.screenshot() }
-                IconBtn(sym: "gearshape", on: m.expanded) { withAnimation(.easeOut(duration: 0.2)) { m.expanded.toggle() } }
+                IconBtn(sym: "gearshape", on: m.expanded) { withAnimation(Perf.noAnim ? nil : Animation.easeOut(duration: 0.2)) { m.expanded.toggle() } }
             }
             .padding(10)
             if m.expanded {
                 Rectangle().fill(Color.line).frame(height: 1)
                 HStack(spacing: 4) {
-                    ForEach(0..<4, id: \.self) { i in
+                    ForEach(0..<5, id: \.self) { i in
                         Text(tabs[i])
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundColor(m.tab == i ? Color.black : Color.white.opacity(0.7))
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background(Capsule().fill(m.tab == i ? Color.white : Color.clear))
-                            .contentShape(Capsule())
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: Look.pill, style: .continuous).fill(m.tab == i ? Color.white : Color.clear))
+                            .contentShape(RoundedRectangle(cornerRadius: Look.pill, style: .continuous))
                             .onTapGesture { m.tab = i }
                     }
                     Spacer()
@@ -945,6 +1372,7 @@ struct OverlayView: View {
                         case 0: RecTab()
                         case 1: RepTab()
                         case 2: ShotTab()
+                        case 3: PerfTab()
                         default: OtherTab()
                         }
                     }
@@ -953,9 +1381,10 @@ struct OverlayView: View {
                 }
             }
         }
+        .id(look.rev)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.black))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.line, lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: Look.r(16), style: .continuous).fill(Color.black))
+        .overlay(RoundedRectangle(cornerRadius: Look.r(16), style: .continuous).strokeBorder(Color.line, lineWidth: 1))
         .preferredColorScheme(.dark)
     }
 }
@@ -998,7 +1427,7 @@ struct SetupView: View {
             }
         }
         .padding(30)
-        .frame(width: 460, height: 470, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.black)
         .preferredColorScheme(.dark)
         .onReceive(timer) { _ in
@@ -1024,9 +1453,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func go() {
         Overlay.shared.place()
         Overlay.shared.panel.orderFrontRegardless()
-        HotKey.action = { Overlay.shared.toggle() }
+        HotKey.action = { if Perf.lite { Lite.shared.toggleMenu() } else { Overlay.shared.toggle() } }
         HotKey.register()
         LoginItem.set(UD.bool(forKey: "launch"))
+        Watermark.shared.refresh()
         Ctl.shared.sync()
     }
 
@@ -1053,12 +1483,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showSetup() {
         if let w = setupWin { NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil); return }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 470),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 580),
                          styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         w.titlebarAppearsTransparent = true; w.titleVisibility = .hidden
         w.isMovableByWindowBackground = true; w.isReleasedWhenClosed = false
         w.backgroundColor = .black; w.appearance = NSAppearance(named: .darkAqua)
-        w.contentView = NSHostingView(rootView: SetupView { [weak self] in self?.finishSetup() })
+        let hv = NSHostingView(rootView: SetupView { [weak self] in self?.finishSetup() })
+        hv.sizingOptions = []
+        w.contentView = hv
         w.center()
         setupWin = w
         NSApp.activate(ignoringOtherApps: true)
